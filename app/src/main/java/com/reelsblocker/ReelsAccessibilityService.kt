@@ -1,6 +1,8 @@
 package com.reelsblocker
 
 import android.accessibilityservice.AccessibilityService
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -8,15 +10,14 @@ import android.view.accessibility.AccessibilityNodeInfo
 /**
  * Accessibility Service that monitors Instagram for Reels navigation.
  *
- * Detection strategy:
- * 1. Listens for TYPE_WINDOW_STATE_CHANGED and TYPE_WINDOW_CONTENT_CHANGED events
- *    from com.instagram.android
- * 2. Traverses the accessibility node tree looking for Reels indicators:
- *    - Content descriptions containing "Reels"
- *    - Tab selections for the Reels tab
- *    - Known Instagram Reels activity/fragment class names
- * 3. When Reels is detected → shows the blocking overlay
- * 4. When user navigates away from Reels → dismisses the overlay
+ * Detection strategy (multiple signals):
+ * 1. Content descriptions containing reels/clips keywords
+ * 2. Text labels in the UI containing reels keywords
+ * 3. Selected bottom navigation tabs for Reels
+ * 4. View resource IDs containing reels/clips identifiers
+ * 5. Class names of known Reels activities/fragments
+ *
+ * Dismissal uses a debounce delay to avoid flickering.
  */
 class ReelsAccessibilityService : AccessibilityService() {
 
@@ -24,169 +25,262 @@ class ReelsAccessibilityService : AccessibilityService() {
         private const val TAG = "ReelsBlocker"
         private const val INSTAGRAM_PACKAGE = "com.instagram.android"
 
-        // Known class names associated with Instagram Reels
-        private val REELS_CLASS_INDICATORS = listOf(
-            "clips_viewer",         // Internal Reels viewer fragment
-            "reels",                // Generic reels reference
-            "ClipsViewerFragment",  // Reels viewer fragment
-            "ReelsFragment"         // Reels tab fragment
-        )
+        // Enable this to log the full accessibility node tree (for debugging)
+        private const val DEBUG_LOG_TREE = true
 
-        // Content description keywords that indicate Reels
-        private val REELS_CONTENT_KEYWORDS = listOf(
-            "reels",
+        // Delay before dismissing overlay (ms) — prevents flickering during page transitions
+        private const val DISMISS_DELAY_MS = 1500L
+
+        // How often we re-check the tree after detecting Reels (ms)
+        private const val RECHECK_INTERVAL_MS = 2000L
+
+        // Keywords in content descriptions, text, or view IDs that indicate Reels
+        private val REELS_KEYWORDS = listOf(
             "reel",
-            "clips"
+            "reels",
+            "clips",
+            "clips_viewer",
+            "clip_viewer",
+            "reels_viewer",
+            "reels_tab",
+            "clips_tab"
         )
 
-        // Tab-related content descriptions
-        private val REELS_TAB_DESCRIPTIONS = listOf(
+        // Additional class name fragments that indicate Reels components
+        private val REELS_CLASS_FRAGMENTS = listOf(
+            "clips",
             "reels",
-            "reels tab"
+            "reel_viewer",
+            "clip_viewer",
+            "ClipsViewerFragment",
+            "ReelViewerFragment",
+            "ReelsFragment",
+            "IgReelsFragment"
         )
     }
 
+    private val handler = Handler(Looper.getMainLooper())
+    private var dismissRunnable: Runnable? = null
+    private var isCurrentlyOnReels = false
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        if (event.packageName?.toString() != INSTAGRAM_PACKAGE) return
+        val packageName = event.packageName?.toString() ?: return
+        if (packageName != INSTAGRAM_PACKAGE) return
+
         if (!PrefsManager.isBlockingEnabled(this)) {
-            // If blocking is disabled, make sure overlay is dismissed
             if (OverlayManager.isShowing) {
                 OverlayManager.dismiss()
             }
             return
         }
 
+        // Log event type for debugging
+        val eventTypeStr = AccessibilityEvent.eventTypeToString(event.eventType)
+        Log.d(TAG, "Event: $eventTypeStr | class=${event.className} | desc=${event.contentDescription}")
+
         when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                handleWindowStateChange(event)
-            }
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                handleContentChange(event)
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                checkForReels(event)
             }
         }
     }
 
     /**
-     * Handle window state changes — detecting when Reels activities are launched.
+     * Main detection entry point — checks multiple signals for Reels.
      */
-    private fun handleWindowStateChange(event: AccessibilityEvent) {
-        val className = event.className?.toString()?.lowercase() ?: return
+    private fun checkForReels(event: AccessibilityEvent) {
+        // Signal 1: Check the event itself
+        val eventClass = event.className?.toString()?.lowercase() ?: ""
+        val eventDesc = event.contentDescription?.toString()?.lowercase() ?: ""
+        val eventText = event.text?.joinToString(" ")?.lowercase() ?: ""
 
-        // Check if the class name contains Reels indicators
-        val isReelsActivity = REELS_CLASS_INDICATORS.any { indicator ->
-            className.contains(indicator)
+        val eventMatch = REELS_KEYWORDS.any { kw ->
+            eventClass.contains(kw) || eventDesc.contains(kw) || eventText.contains(kw)
+        } || REELS_CLASS_FRAGMENTS.any { frag ->
+            eventClass.contains(frag.lowercase())
         }
 
-        if (isReelsActivity) {
-            Log.d(TAG, "Reels activity detected via class: $className")
-            showOverlay()
+        if (eventMatch) {
+            Log.d(TAG, "✅ REELS DETECTED via event — class=$eventClass desc=$eventDesc text=$eventText")
+            onReelsDetected()
             return
         }
 
-        // Also check content description of the event
-        val contentDesc = event.contentDescription?.toString()?.lowercase()
-        if (contentDesc != null && REELS_CONTENT_KEYWORDS.any { contentDesc.contains(it) }) {
-            Log.d(TAG, "Reels detected via content description: $contentDesc")
-            showOverlay()
-            return
-        }
+        // Signal 2: Walk the node tree
+        val treeResult = scanNodeTree()
 
-        // If we're on a different screen within Instagram, dismiss overlay
-        if (!isReelsRelatedScreen()) {
-            dismissOverlay()
+        if (treeResult) {
+            Log.d(TAG, "✅ REELS DETECTED via node tree scan")
+            onReelsDetected()
+        } else {
+            onReelsNotDetected()
         }
     }
 
     /**
-     * Handle content changes — detecting Reels tab navigation via node tree.
+     * Scan the full accessibility node tree for Reels indicators.
      */
-    private fun handleContentChange(event: AccessibilityEvent) {
-        if (isReelsRelatedScreen()) {
-            Log.d(TAG, "Reels detected via content tree scan")
-            showOverlay()
-        } else if (OverlayManager.isShowing) {
-            // Small debounce — only dismiss if we're consistently not on Reels
-            dismissOverlay()
-        }
-    }
+    private fun scanNodeTree(): Boolean {
+        val rootNode = try {
+            rootInActiveWindow
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to get root node: ${e.message}")
+            null
+        } ?: return false
 
-    /**
-     * Traverse the accessibility node tree to detect Reels-related content.
-     */
-    private fun isReelsRelatedScreen(): Boolean {
-        val rootNode = rootInActiveWindow ?: return false
         return try {
-            checkNodeForReels(rootNode, depth = 0)
+            scanNode(rootNode, depth = 0)
         } finally {
-            rootNode.recycle()
+            try { rootNode.recycle() } catch (_: Exception) {}
         }
     }
 
     /**
-     * Recursively check nodes for Reels indicators.
-     * Limited to depth 5 to avoid performance issues.
+     * Recursively scan nodes. Depth limited to 8 levels.
      */
-    private fun checkNodeForReels(node: AccessibilityNodeInfo, depth: Int): Boolean {
-        if (depth > 5) return false
+    private fun scanNode(node: AccessibilityNodeInfo, depth: Int): Boolean {
+        if (depth > 8) return false
 
-        // Check if this is the selected Reels tab
-        val contentDesc = node.contentDescription?.toString()?.lowercase()
-        if (contentDesc != null) {
-            // Check for selected Reels tab
-            if (node.isSelected && REELS_TAB_DESCRIPTIONS.any { contentDesc.contains(it) }) {
+        val contentDesc = node.contentDescription?.toString()?.lowercase() ?: ""
+        val text = node.text?.toString()?.lowercase() ?: ""
+        val className = node.className?.toString()?.lowercase() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+
+        // Debug logging — prints full tree to logcat
+        if (DEBUG_LOG_TREE && depth <= 4) {
+            val indent = "  ".repeat(depth)
+            Log.v(TAG, "${indent}[depth=$depth] class=$className id=$viewId desc=\"$contentDesc\" text=\"$text\" selected=${node.isSelected} focused=${node.isFocused}")
+        }
+
+        // Check 1: Content description or text contains Reels keywords
+        val descOrTextMatch = REELS_KEYWORDS.any { kw ->
+            contentDesc.contains(kw) || text.contains(kw)
+        }
+
+        // Check 2: View ID contains Reels keywords
+        val viewIdMatch = REELS_KEYWORDS.any { kw ->
+            viewId.contains(kw)
+        }
+
+        // Check 3: Class name matches known Reels fragments
+        val classMatch = REELS_CLASS_FRAGMENTS.any { frag ->
+            className.contains(frag.lowercase())
+        }
+
+        // Match found — but apply context-aware filtering
+        if (descOrTextMatch || viewIdMatch || classMatch) {
+            // If it's a selected tab/button with Reels keyword → strong signal
+            if (node.isSelected || node.isFocused) {
+                Log.d(TAG, "🎯 Strong match: selected/focused Reels element — desc=\"$contentDesc\" id=$viewId")
                 return true
             }
-            // Check for Reels content descriptions when the node is a visible element
-            if (REELS_CONTENT_KEYWORDS.any { contentDesc.contains(it) } && node.isVisibleToUser) {
-                // Additional check: is this a navigation/tab element?
-                val className = node.className?.toString()?.lowercase() ?: ""
-                if (className.contains("tab") || className.contains("button") || node.isSelected) {
+
+            // If view ID contains Reels → strong signal (means Instagram has a Reels view on screen)
+            if (viewIdMatch) {
+                Log.d(TAG, "🎯 Strong match: Reels view ID found — id=$viewId")
+                return true
+            }
+
+            // If class name matches Reels fragments → strong signal
+            if (classMatch) {
+                Log.d(TAG, "🎯 Strong match: Reels class name — class=$className")
+                return true
+            }
+
+            // Content description match on a clickable/navigation element
+            if (descOrTextMatch && (node.isClickable || className.contains("button") ||
+                        className.contains("tab") || className.contains("imageview"))) {
+                // This could be just the Reels icon in the tab bar, only match if selected
+                if (node.isSelected) {
+                    Log.d(TAG, "🎯 Strong match: selected Reels tab — desc=\"$contentDesc\"")
                     return true
                 }
+                // Don't match unselected tab buttons — that would trigger on any IG screen
+            } else if (descOrTextMatch) {
+                // Non-interactive element with reels keyword in desc — probably a Reels view
+                Log.d(TAG, "🎯 Match: Reels content on screen — desc=\"$contentDesc\" text=\"$text\"")
+                return true
             }
-        }
-
-        // Check view ID for Reels-related IDs
-        val viewId = node.viewIdResourceName?.lowercase()
-        if (viewId != null && REELS_CLASS_INDICATORS.any { viewId.contains(it) }) {
-            return true
         }
 
         // Recurse into children
         for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
+            val child = try {
+                node.getChild(i)
+            } catch (e: Exception) {
+                null
+            } ?: continue
+
             try {
-                if (checkNodeForReels(child, depth + 1)) {
+                if (scanNode(child, depth + 1)) {
                     return true
                 }
             } finally {
-                child.recycle()
+                try { child.recycle() } catch (_: Exception) {}
             }
         }
 
         return false
     }
 
-    private fun showOverlay() {
+    /**
+     * Called when Reels is detected — show overlay and cancel pending dismissals.
+     */
+    private fun onReelsDetected() {
+        isCurrentlyOnReels = true
+
+        // Cancel any pending dismissal
+        dismissRunnable?.let { handler.removeCallbacks(it) }
+        dismissRunnable = null
+
         if (!OverlayManager.isShowing) {
+            Log.d(TAG, "🚫 SHOWING OVERLAY")
             OverlayManager.show(this)
         }
     }
 
-    private fun dismissOverlay() {
-        if (OverlayManager.isShowing) {
-            OverlayManager.dismiss()
+    /**
+     * Called when Reels is NOT detected — schedule a delayed dismissal.
+     * The delay prevents flickering during Instagram page transitions.
+     */
+    private fun onReelsNotDetected() {
+        if (!isCurrentlyOnReels || !OverlayManager.isShowing) return
+
+        // Only schedule dismissal if one isn't already pending
+        if (dismissRunnable == null) {
+            dismissRunnable = Runnable {
+                // Double-check one more time before dismissing
+                val stillOnReels = scanNodeTree()
+                if (!stillOnReels) {
+                    Log.d(TAG, "✅ Overlay dismissed — user left Reels")
+                    isCurrentlyOnReels = false
+                    OverlayManager.dismiss()
+                } else {
+                    Log.d(TAG, "↩️ Still on Reels — keeping overlay")
+                    dismissRunnable = null
+                }
+            }
+            handler.postDelayed(dismissRunnable!!, DISMISS_DELAY_MS)
         }
     }
 
     override fun onInterrupt() {
         Log.w(TAG, "Accessibility service interrupted")
-        dismissOverlay()
+        cleanup()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        dismissOverlay()
+        cleanup()
+    }
+
+    private fun cleanup() {
+        dismissRunnable?.let { handler.removeCallbacks(it) }
+        dismissRunnable = null
+        isCurrentlyOnReels = false
+        OverlayManager.dismiss()
     }
 }
