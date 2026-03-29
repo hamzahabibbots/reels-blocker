@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Reels Blocker</string>
+
+    <!-- Main Activity -->
+    <string name="app_tagline">Take back control of your time</string>
+    <string name="blocking_label">Reels Blocking</string>
+    <string name="status_active">Active — Reels are blocked</string>
+    <string name="status_inactive">Inactive — Reels are not blocked</string>
+
+    <!-- Permission Section -->
+    <string name="permissions_title">Permissions</string>
+    <string name="accessibility_label">Accessibility Service</string>
+    <string name="accessibility_desc">Monitors Instagram to detect Reels</string>
+    <string name="overlay_label">Display Over Apps</string>
+    <string name="overlay_desc">Shows blocking screen over Reels</string>
+    <string name="permission_granted">Granted</string>
+    <string name="permission_required">Tap to enable</string>
+
+    <!-- Overlay -->
+    <string name="overlay_title">Reels Blocked 🚫</string>
+    <string name="overlay_message">You chose to block Reels.\nStay focused on what matters.</string>
+    <string name="overlay_quote">"The time you enjoy wasting is not wasted time."\n— But this isn\'t it.</string>
+    <string name="overlay_dismiss">← Go Back</string>
+
+    <!-- Accessibility Service -->
+    <string name="accessibility_service_description">Monitors Instagram to detect when you navigate to Reels, then activates the blocking overlay to help you stay focused.</string>
+
+    <!-- Info -->
+    <string name="how_it_works_title">How it works</string>
+    <string name="how_it_works_1">1. Enable both permissions below</string>
+    <string name="how_it_works_2">2. Toggle blocking ON</string>
+    <string name="how_it_works_3">3. Open Instagram — Reels will be blocked</string>
+</resources>

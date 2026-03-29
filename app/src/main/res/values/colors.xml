@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primary brand colors -->
+    <color name="dark_bg">#FF0D0D0D</color>
+    <color name="dark_surface">#FF1A1A2E</color>
+    <color name="dark_card">#FF16213E</color>
+    <color name="accent_red">#FFFF4757</color>
+    <color name="accent_red_dark">#FFE84040</color>
+    <color name="accent_purple">#FF6C5CE7</color>
+    <color name="accent_purple_light">#FFA29BFE</color>
+    <color name="text_primary">#FFFAFAFA</color>
+    <color name="text_secondary">#FFB0B0C0</color>
+    <color name="text_muted">#FF6C6C80</color>
+    <color name="green_active">#FF00D2A0</color>
+    <color name="green_active_bg">#2000D2A0</color>
+    <color name="orange_warning">#FFFFA502</color>
+    <color name="orange_warning_bg">#20FFA502</color>
+    <color name="divider">#FF2A2A40</color>
+    <color name="overlay_bg">#E6000000</color>
+
+    <!-- Gradient endpoints -->
+    <color name="gradient_start">#FF0D0D0D</color>
+    <color name="gradient_end">#FF1A1A2E</color>
+    <color name="card_gradient_start">#FF16213E</color>
+    <color name="card_gradient_end">#FF0F3460</color>
+    <color name="overlay_gradient_start">#F2000000</color>
+    <color name="overlay_gradient_mid">#E61A1A2E</color>
+    <color name="overlay_gradient_end">#F2000000</color>
+</resources>
