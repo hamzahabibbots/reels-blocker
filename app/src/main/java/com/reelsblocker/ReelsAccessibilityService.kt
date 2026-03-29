@@ -1,6 +1,8 @@
 package com.reelsblocker
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Intent
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -10,32 +12,28 @@ import android.view.accessibility.AccessibilityNodeInfo
 /**
  * Accessibility Service that monitors Instagram for Reels navigation.
  *
- * KEY DESIGN: Once the overlay is shown, it stays until the user taps "Go Back".
- * We do NOT auto-dismiss based on tree scanning (because the overlay covers Instagram,
- * making the tree scan return false — which would incorrectly dismiss the overlay).
- *
- * After the user dismisses the overlay, we press Back to navigate away from Reels,
- * then resume monitoring for the next time they navigate to Reels.
+ * Once the overlay is shown, it stays until the user taps "Go Back".
+ * After dismissal, redirects user to Instagram DMs and enters cooldown.
  */
 class ReelsAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "ReelsBlocker"
         private const val INSTAGRAM_PACKAGE = "com.instagram.android"
-
-        // Cooldown after user dismisses overlay before we can re-trigger (ms)
         private const val COOLDOWN_AFTER_DISMISS_MS = 3000L
 
-        // Keywords that indicate Reels content
+        // Reels keywords — matched against content descriptions, text, view IDs
         private val REELS_KEYWORDS = listOf(
             "reel",
             "reels",
             "clips",
             "clips_viewer",
-            "clip_viewer",
             "reels_viewer",
             "reels_tab",
-            "clips_tab"
+            "clips_tab",
+            "short_video",        // Some regions use this
+            "explore_reel",
+            "reel_viewer"
         )
 
         // Class name fragments for Reels components
@@ -49,41 +47,49 @@ class ReelsAccessibilityService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private var inCooldown = false
+    private var lastTreeDumpTime = 0L
 
     override fun onCreate() {
         super.onCreate()
-
-        // When user taps "Go Back" on the overlay
         OverlayManager.onDismissed = {
-            Log.d(TAG, "User dismissed overlay — pressing Back and entering cooldown")
+            Log.d(TAG, "User dismissed overlay — redirecting to Instagram DMs")
 
-            // Press Back to navigate away from Reels
-            performGlobalAction(GLOBAL_ACTION_BACK)
+            // Open Instagram DMs to navigate away from Reels completely
+            try {
+                val dmIntent = Intent(Intent.ACTION_VIEW, Uri.parse("instagram://direct_inbox"))
+                dmIntent.setPackage(INSTAGRAM_PACKAGE)
+                dmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                startActivity(dmIntent)
+            } catch (e: Exception) {
+                Log.w(TAG, "DM deep link failed, trying fallback: ${e.message}")
+                // Fallback: open Instagram main screen
+                try {
+                    val fallback = packageManager.getLaunchIntentForPackage(INSTAGRAM_PACKAGE)
+                    fallback?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    fallback?.let { startActivity(it) }
+                } catch (_: Exception) {
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                }
+            }
 
-            // Enter cooldown so we don't immediately re-trigger
             inCooldown = true
             handler.postDelayed({
                 inCooldown = false
-                Log.d(TAG, "Cooldown ended — monitoring resumed")
+                Log.d(TAG, "Cooldown ended")
             }, COOLDOWN_AFTER_DISMISS_MS)
         }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        val packageName = event.packageName?.toString() ?: return
-        if (packageName != INSTAGRAM_PACKAGE) return
+        val pkg = event.packageName?.toString() ?: return
+        if (pkg != INSTAGRAM_PACKAGE) return
 
-        // If blocking is disabled, dismiss any showing overlay
         if (!PrefsManager.isBlockingEnabled(this)) {
             if (OverlayManager.isShowing) OverlayManager.dismiss()
             return
         }
-
-        // If overlay is already showing, do nothing — it stays until user dismisses
         if (OverlayManager.isShowing) return
-
-        // If in cooldown after dismissal, don't re-trigger
         if (inCooldown) return
 
         when (event.eventType) {
@@ -95,104 +101,115 @@ class ReelsAccessibilityService : AccessibilityService() {
         }
     }
 
-    /**
-     * Check multiple signals for Reels content.
-     */
     private fun checkForReels(event: AccessibilityEvent) {
-        // Signal 1: Check the event itself
+        // Signal 1: Check event metadata
         val eventClass = event.className?.toString()?.lowercase() ?: ""
         val eventDesc = event.contentDescription?.toString()?.lowercase() ?: ""
         val eventText = event.text?.joinToString(" ")?.lowercase() ?: ""
 
-        val eventMatch = REELS_KEYWORDS.any { kw ->
-            eventClass.contains(kw) || eventDesc.contains(kw) || eventText.contains(kw)
-        } || REELS_CLASS_FRAGMENTS.any { frag ->
-            eventClass.contains(frag)
-        }
-
-        if (eventMatch) {
-            Log.d(TAG, "✅ REELS via event — class=$eventClass desc=$eventDesc")
+        if (matchesReels(eventClass, eventDesc, eventText)) {
+            Log.d(TAG, "✅ REELS via event — class=$eventClass desc=$eventDesc text=$eventText")
             showOverlay()
             return
         }
 
-        // Signal 2: Scan the node tree
-        if (scanNodeTree()) {
-            Log.d(TAG, "✅ REELS via node tree")
-            showOverlay()
+        // Signal 2: Scan node tree
+        val rootNode = try { rootInActiveWindow } catch (_: Exception) { null }
+        if (rootNode != null) {
+            try {
+                if (scanNode(rootNode, 0)) {
+                    showOverlay()
+                    return
+                }
+
+                // Dump tree periodically for debugging (max once every 5 seconds)
+                val now = System.currentTimeMillis()
+                if (now - lastTreeDumpTime > 5000 && event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                    lastTreeDumpTime = now
+                    Log.d(TAG, "--- TREE DUMP (no Reels detected) ---")
+                    dumpTree(rootNode, 0)
+                    Log.d(TAG, "--- END TREE DUMP ---")
+                }
+            } finally {
+                try { rootNode.recycle() } catch (_: Exception) {}
+            }
         }
     }
 
-    /**
-     * Scan the accessibility node tree for Reels indicators.
-     */
-    private fun scanNodeTree(): Boolean {
-        val rootNode = try {
-            rootInActiveWindow
-        } catch (e: Exception) {
-            null
-        } ?: return false
-
-        return try {
-            scanNode(rootNode, depth = 0)
-        } finally {
-            try { rootNode.recycle() } catch (_: Exception) {}
+    private fun matchesReels(className: String, desc: String, text: String): Boolean {
+        return REELS_KEYWORDS.any { kw ->
+            desc.contains(kw) || text.contains(kw) || className.contains(kw)
+        } || REELS_CLASS_FRAGMENTS.any { frag ->
+            className.contains(frag)
         }
     }
 
-    /**
-     * Recursively scan nodes, depth limited to 8.
-     */
     private fun scanNode(node: AccessibilityNodeInfo, depth: Int): Boolean {
-        if (depth > 8) return false
+        if (depth > 10) return false
 
         val contentDesc = node.contentDescription?.toString()?.lowercase() ?: ""
         val text = node.text?.toString()?.lowercase() ?: ""
         val className = node.className?.toString()?.lowercase() ?: ""
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
 
-        // Check content description, text, view ID, and class name for Reels signals
-        val descMatch = REELS_KEYWORDS.any { contentDesc.contains(it) || text.contains(it) }
-        val viewIdMatch = REELS_KEYWORDS.any { viewId.contains(it) }
+        // Check all signals
+        val kwMatch = REELS_KEYWORDS.any { kw ->
+            contentDesc.contains(kw) || text.contains(kw) || viewId.contains(kw)
+        }
         val classMatch = REELS_CLASS_FRAGMENTS.any { className.contains(it) }
 
-        if (viewIdMatch || classMatch) {
-            // View ID or class name match = strong signal, always trigger
+        if (kwMatch || classMatch) {
+            Log.d(TAG, "🎯 Match at depth=$depth: desc=\"$contentDesc\" text=\"$text\" id=$viewId class=$className selected=${node.isSelected}")
             return true
         }
 
-        if (descMatch) {
-            // Content desc match — only trigger if it's a selected tab or a non-interactive label
-            if (node.isSelected) return true
-            if (!node.isClickable) return true
-            // Clickable + selected = reels tab is active
-            if (node.isClickable && node.isSelected) return true
-        }
-
-        // Recurse into children
+        // Recurse
         for (i in 0 until node.childCount) {
-            val child = try { node.getChild(i) } catch (e: Exception) { null } ?: continue
+            val child = try { node.getChild(i) } catch (_: Exception) { null } ?: continue
             try {
                 if (scanNode(child, depth + 1)) return true
             } finally {
                 try { child.recycle() } catch (_: Exception) {}
             }
         }
-
         return false
+    }
+
+    /**
+     * Dump the full accessibility tree to logcat for debugging.
+     */
+    private fun dumpTree(node: AccessibilityNodeInfo, depth: Int) {
+        if (depth > 6) return
+        val indent = "  ".repeat(depth)
+        val desc = node.contentDescription?.toString() ?: ""
+        val text = node.text?.toString() ?: ""
+        val cls = node.className?.toString() ?: ""
+        val viewId = node.viewIdResourceName ?: ""
+        val sel = if (node.isSelected) " [SEL]" else ""
+        val click = if (node.isClickable) " [CLICK]" else ""
+
+        if (desc.isNotEmpty() || text.isNotEmpty() || viewId.isNotEmpty()) {
+            Log.d(TAG, "${indent}cls=$cls id=$viewId desc=\"$desc\" text=\"$text\"$sel$click")
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = try { node.getChild(i) } catch (_: Exception) { null } ?: continue
+            try {
+                dumpTree(child, depth + 1)
+            } finally {
+                try { child.recycle() } catch (_: Exception) {}
+            }
+        }
     }
 
     private fun showOverlay() {
         if (!OverlayManager.isShowing) {
-            Log.d(TAG, "🚫 SHOWING OVERLAY — stays until user dismisses")
+            Log.d(TAG, "🚫 SHOWING OVERLAY")
             OverlayManager.show(this)
         }
     }
 
-    override fun onInterrupt() {
-        Log.w(TAG, "Service interrupted")
-    }
-
+    override fun onInterrupt() {}
     override fun onDestroy() {
         super.onDestroy()
         handler.removeCallbacksAndMessages(null)
